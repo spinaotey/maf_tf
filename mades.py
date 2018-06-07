@@ -178,8 +178,7 @@ class GaussianMade:
         :param log: whether to return probabilities in the log domain
         :return: list of log probabilities log p(x)
         """
-
-        # compile theano function, if haven't already done so
+        
         lprob = sess.run(self.L,feed_dict={self.input:x})
 
         return lprob if log else np.exp(lprob)
