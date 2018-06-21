@@ -26,7 +26,8 @@ class MaskedAutoregressiveFlow:
     mades are of the same type. If there is only one made in the stack, then it's equivalent to a single made.
     """
 
-    def __init__(self, n_inputs, n_hiddens, act_fun, n_mades, batch_norm=True, input_order='sequential', mode='sequential', input=None):
+    def __init__(self, n_inputs, n_hiddens, act_fun, n_mades, batch_norm=True, momentum=0.2, 
+                 input_order='sequential', mode='sequential', input=None):
         """
         Constructor.
         :param n_inputs: number of inputs
@@ -34,6 +35,7 @@ class MaskedAutoregressiveFlow:
         :param act_fun: name of activation function
         :param n_mades: number of mades
         :param batch_norm: whether to use batch normalization between mades
+        :param momentum: momentum for moving mean and variance of the batch normalization layers
         :param input_order: order of inputs of last made
         :param mode: strategy for assigning degrees to hidden nodes: can be 'random' or 'sequential'
         :param input: tensorflow placeholder to serve as input; if None, a new placeholder is created
@@ -45,9 +47,11 @@ class MaskedAutoregressiveFlow:
         self.act_fun = act_fun
         self.n_mades = n_mades
         self.batch_norm = batch_norm
+        self.momentum = momentum
         self.mode = mode
 
         self.input = tf.placeholder(dtype=dtype,shape=[None,n_inputs],name='x') if input is None else input
+        self.training = tf.placeholder_with_default(False,shape=(),name="training")
         self.parms = []
 
         self.mades = []
@@ -65,21 +69,22 @@ class MaskedAutoregressiveFlow:
 
             # inverse autoregressive transform
             self.u = made.u
-            self.logdet_dudx += 0.5 * tf.reduce_sum(made.logp, axis=1)
+            self.logdet_dudx += 0.5 * tf.reduce_sum(made.logp, axis=1,keepdims=True)
 
-            # TODO batch normalization, NOT WORKING
+            # batch normalization
             if batch_norm:
-                bn = BatchNormalizationExt()
-                _,v_tmp = tf.nn.moments(self.u,[0])
-                self.u = bn(self.u)
-                self.parms += bn.variables
+                bn = BatchNormalizationExt(momentum=self.momentum)
+                v_tmp = tf.nn.moments(self.u,[0])[1]
+                self.u = bn.apply(self.u,training=self.training)
+                self.parms += [bn.gamma,bn.beta]
+                v_tmp = tf.cond(self.training,lambda:v_tmp,lambda:bn.moving_variance)
                 self.logdet_dudx += tf.reduce_sum(tf.log(bn.gamma)) - 0.5 * tf.reduce_sum(tf.log(v_tmp+1e-5))
                 self.bns.append(bn)
 
         self.input_order = self.mades[0].input_order
 
         # log likelihoods
-        self.L = tf.add(-0.5 * n_inputs * np.log(2 * np.pi) - 0.5 * tf.reduce_sum(self.u ** 2, axis=1),
+        self.L = tf.add(-0.5 * n_inputs * np.log(2 * np.pi) - 0.5 * tf.reduce_sum(self.u ** 2, axis=1,keepdims=True),
                         self.logdet_dudx,name='L')
 
         # train objective
@@ -127,7 +132,7 @@ class MaskedAutoregressiveFlow:
         Givan a dataset, calculate the random numbers used internally to generate the dataset.
         :param x: numpy array, rows are datapoints
         :param sess: tensorflow session where the graph is run
-        :return: numpy array, rows are corresponding random numbers
+        :return: numpy arrhttp://localhost:8888/notebooks/mafs.ipynb#ay, rows are corresponding random numbers
         """
 
         return sess.run(self.u,feed_dict={self.input:x})
