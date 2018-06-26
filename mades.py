@@ -78,7 +78,7 @@ def create_weights(n_inputs, n_hiddens, n_comps):
     :param n_inputs: the number of inputs
     :param n_hiddens: a list with the number of hidden units
     :param n_comps: number of gaussian components
-    :return: weights and biases, as theano shared variables
+    :return: weights and biases, as tensorflow variables
     """
 
     Ws = []
@@ -112,6 +112,20 @@ def create_weights(n_inputs, n_hiddens, n_comps):
 
     return Ws, bs, Wm, bm, Wp, bp, Wa, ba
 
+def create_weights_conditional(n_inputs, n_outputs, n_hiddens, n_comps):
+    """
+    Creates all learnable weight matrices and bias vectors for a conditional made.
+    :param n_inputs: the number of (conditional) inputs
+    :param n_outputs: the number of outputs
+    :param n_hiddens: a list with the number of hidden units
+    :param n_comps: number of gaussian components
+    :return: weights and biases, as tensorflow variables
+    """
+
+    Wx = tf.Variable(rng.randn(n_inputs, n_hiddens[0]) / np.sqrt(n_inputs + 1), dtype=dtype, name='Wx')
+
+    return (Wx,) + create_weights(n_outputs, n_hiddens, n_comps)
+
 class GaussianMade:
     """
     Implements a Made, where each conditional probability is modelled by a single gaussian component.
@@ -123,10 +137,10 @@ class GaussianMade:
         Constructor.
         :param n_inputs: number of inputs
         :param n_hiddens: list with number of hidden units for each hidden layer
-        :param act_fun: name of activation function
+        :param act_fun: tensorflow activation function
         :param input_order: order of inputs
         :param mode: strategy for assigning degrees to hidden nodes: can be 'random' or 'sequential'
-        :param input: theano variable to serve as input; if None, a new variable is created
+        :param input: tensorflow placeholder to serve as input; if None, a new placeholder is created
         """
 
         # save input arguments
@@ -211,7 +225,7 @@ class GaussianMade:
             x[:, idx] = m[:, idx] + np.exp(np.minimum(-0.5 * logp[:, idx], 10.0)) * u[:, idx]
 
         return x
-    def calc_random_numbers(self, x,sess):
+    def calc_random_numbers(self, x, sess):
         """
         Givan a dataset, calculate the random numbers made uses internally to generate the dataset.
         :param x: numpy array, rows are datapoints
@@ -220,3 +234,124 @@ class GaussianMade:
         """
 
         return sess.run(self.u,feed_dict={self.input:x})
+    
+class ConditionalGaussianMade:
+    """
+    Implements a Made, where each conditional probability is modelled by a single gaussian component. The made has
+    inputs which is always conditioned on, and whose probability it doesn't model.
+    """
+
+    def __init__(self, n_inputs, n_outputs, n_hiddens, act_fun, output_order='sequential', mode='sequential', input=None, output=None):
+        """
+        Constructor.
+        :param n_inputs: number of (conditional) inputs
+        :param n_outputs: number of outputs
+        :param n_hiddens: list with number of hidden units for each hidden layer
+        :param act_fun: tensorflow activation function
+        :param output_order: order of outputs
+        :param mode: strategy for assigning degrees to hidden nodes: can be 'random' or 'sequential'
+        :param input: tensorflow placeholder to serve as input; if None, a new placeholder is created
+        :param output: tensorflow placeholder to serve as output; if None, a new placeholder is created
+        """
+
+        # save input arguments
+        self.n_inputs = n_inputs
+        self.n_outputs = n_outputs
+        self.n_hiddens = n_hiddens
+        self.act_fun = act_fun
+        self.mode = mode
+
+        # create network's parameters
+        degrees = create_degrees(n_outputs, n_hiddens, output_order, mode)
+        Ms, Mmp = create_masks(degrees)
+        Wx, Ws, bs, Wm, bm, Wp, bp = create_weights_conditional(n_inputs, n_outputs, n_hiddens, None)
+        self.parms = [Wx] + Ws + bs + [Wm, bm, Wp, bp]
+        self.output_order = degrees[0]
+
+        # activation function
+        f = self.act_fun
+
+        # input matrices
+        self.input = tf.placeholder(dtype=dtype,shape=[None,n_inputs],name='x') if input is None else input
+        self.y = tf.placeholder(dtype=dtype,shape=[None,n_outputs],name='y') if output is None else output
+
+        # feedforward propagation
+        h = f(tf.matmul(self.input, Wx) + tf.matmul(self.y, Ms[0] * Ws[0]) + bs[0],name='h1')
+        for l, (M, W, b) in enumerate(zip(Ms[1:], Ws[1:], bs[1:])):
+            h = f(tf.matmul(h, M * W) + b,name='h'+str(l + 2))
+
+        # output means
+        self.m = tf.add(tf.matmul(h, Mmp * Wm), bm, name='m')
+
+        # output log precisions
+        self.logp = tf.add(tf.matmul(h, Mmp * Wp), bp, name='logp')
+
+        # random numbers driving made
+        self.u = tf.exp(0.5 * self.logp) * (self.y - self.m)
+
+        # log likelihoods
+        self.L = tf.multiply(-0.5,n_inputs * np.log(2 * np.pi) + \
+                     tf.reduce_sum(self.u ** 2 - self.logp, axis=1,keepdims=True),name='L')
+
+        # train objective
+        self.trn_loss = -tf.reduce_mean(self.L, name='trn_loss')
+
+    def eval(self, xy, sess, log=True):
+        """
+        Evaluate log probabilities for given input-output pairs.
+        :param xy: a pair (x, y) where x rows are inputs and y rows are outputs
+        :param sess: tensorflow session where the graph is run
+        :param log: whether to return probabilities in the log domain
+        :return: log probabilities: log p(y|x)
+        """
+        
+        x, y = xy
+        lprob = sess.run(self.L,feed_dict={self.input:x, self.y:y})
+        
+        return lprob if log else np.exp(lprob)
+
+    def eval_comps(self, xy, sess):
+        """
+        Evaluate the parameters of all gaussians at given input locations.
+        :param xy: a pair (x, y) where x rows are inputs and y rows are outputs
+        :param sess: tensorflow session where the graph is run
+        :return: means and log precisions
+        """
+
+        x, y = xy
+        
+        return sess.run([self.m,self.logp],feed_dict={self.input:x, self.y:y})
+
+    def gen(self, x, sess, n_samples=1, u=None):
+        """
+        Generate samples from made conditioned on x. Requires as many evaluations as number of outputs.
+        :param x: input vector
+        :param sess: tensorflow session where the graph is run
+        :param n_samples: number of samples
+        :param u: random numbers to use in generating samples; if None, new random numbers are drawn
+        :return: samples
+        """
+
+        y = np.zeros([n_samples, self.n_outputs], dtype=dtype)
+        u = rng.randn(n_samples, self.n_outputs).astype(dtype) if u is None else u
+
+        xy = (np.tile(x, [n_samples, 1]), y)
+
+        for i in range(1, self.n_outputs + 1):
+            m, logp = self.eval_comps(xy,sess)
+            idx = np.argwhere(self.output_order == i)[0, 0]
+            y[:, idx] = m[:, idx] + np.exp(np.minimum(-0.5 * logp[:, idx], 10.0)) * u[:, idx]
+
+        return y
+
+    def calc_random_numbers(self, xy, sess):
+        """
+        Givan a dataset, calculate the random numbers made uses internally to generate the dataset.
+        :param xy: a pair (x, y) of numpy arrays, where x rows are inputs and y rows are outputs
+        :param sess: tensorflow session where the graph is run
+        :return: numpy array, rows are corresponding random numbers
+        """
+
+
+        x, y = xy
+        return sess.run(self.u,feed_dict={self.input:x, self.y:y})
