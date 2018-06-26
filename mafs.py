@@ -32,7 +32,7 @@ class MaskedAutoregressiveFlow:
         Constructor.
         :param n_inputs: number of inputs
         :param n_hiddens: list with number of hidden units for each hidden layer
-        :param act_fun: name of activation function
+        :param act_fun: tensorflow activation function
         :param n_mades: number of mades
         :param batch_norm: whether to use batch normalization between mades
         :param momentum: momentum for moving mean and variance of the batch normalization layers
