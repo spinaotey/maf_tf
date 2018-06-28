@@ -142,7 +142,7 @@ class ConditionalMaskedAutoregressiveFlow:
     Implements a Conditional Masked Autoregressive Flow.
     """
 
-    def __init__(self, n_inputs, n_outputs, n_hiddens, act_fun, n_mades, batch_norm=True, momentum=0.2,
+    def __init__(self, n_inputs, n_outputs, n_hiddens, act_fun, n_mades, batch_norm=False, momentum=0.2,
                  output_order='sequential', mode='sequential', input=None, output=None):
         """
         Constructor.
