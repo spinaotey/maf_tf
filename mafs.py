@@ -26,7 +26,7 @@ class MaskedAutoregressiveFlow:
     mades are of the same type. If there is only one made in the stack, then it's equivalent to a single made.
     """
 
-    def __init__(self, n_inputs, n_hiddens, act_fun, n_mades, batch_norm=True, momentum=0.2, 
+    def __init__(self, n_inputs, n_hiddens, act_fun, n_mades, batch_norm=False, momentum=0.2, 
                  input_order='sequential', mode='sequential', input=None):
         """
         Constructor.
