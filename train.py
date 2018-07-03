@@ -32,7 +32,7 @@ class Trainer:
     def train(self, sess, train_data, val_data=None, p_val = 0.05, max_epochs=1000, batch_size=100,
               early_stopping=20, check_every_N=5, saver_name='tmp_model', show_log=False):
         """
-        Constructor that defines the training operation.
+        Training function to be called with desired parameters within a tensorflow session.
         :param sess: tensorflow session where the graph is run.
         :param train_data: train data to be used.
         :param val_data: validation data to be used for early stopping. If None, train_data is splitted 
@@ -108,7 +108,7 @@ class ConditionalTrainer(Trainer):
     def train(self, sess, train_data, val_data=None, p_val = 0.05, max_epochs=1000, batch_size=100,
               early_stopping=20, check_every_N=5, saver_name='tmp_model', show_log=False):
         """
-        Constructor that defines the training operation.
+        Training function to be called with desired parameters within a tensorflow session.
         :param sess: tensorflow session where the graph is run.
         :param train_data: a tuple/list of (X,Y) with training data where Y is conditioned on X.
         :param val_data: a tuple/list of (X,Y) with validation data where Y is conditioned on X to be 
