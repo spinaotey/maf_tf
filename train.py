@@ -10,7 +10,7 @@ class Trainer:
     def __init__(self, model, optimizer=tf.train.AdamOptimizer, optimizer_arguments={}):
         """
         Constructor that defines the training operation.
-        :param model: made/maf to be trained.
+        :param model: made/maf instance to be trained.
         :param optimizer: tensorflow optimizer class to be used during training.
         :param optimizer_arguments: dictionary of arguments for optimizer intialization.
         """
