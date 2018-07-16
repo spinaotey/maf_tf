@@ -205,7 +205,7 @@ class ConditionalMaskedAutoregressiveFlow:
         self.output_order = self.mades[0].output_order
 
         # log likelihoods
-        self.L = tf.add(-0.5 * n_inputs * np.log(2 * np.pi) - 0.5 * tf.reduce_sum(self.u ** 2, axis=1,keepdims=True),
+        self.L = tf.add(-0.5 * n_outputs * np.log(2 * np.pi) - 0.5 * tf.reduce_sum(self.u ** 2, axis=1,keepdims=True),
                         self.logdet_dudy,name='L')
 
         # train objective

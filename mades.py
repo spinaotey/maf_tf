@@ -290,7 +290,7 @@ class ConditionalGaussianMade:
         self.u = tf.exp(0.5 * self.logp) * (self.y - self.m)
 
         # log likelihoods
-        self.L = tf.multiply(-0.5,n_inputs * np.log(2 * np.pi) + \
+        self.L = tf.multiply(-0.5,n_outputs * np.log(2 * np.pi) + \
                      tf.reduce_sum(self.u ** 2 - self.logp, axis=1,keepdims=True),name='L')
 
         # train objective
