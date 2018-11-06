@@ -6,16 +6,47 @@ import mades
 
 dtype = tf.float32
 
-class BatchNormalizationExt(tf.layers.BatchNormalization):
+class BatchNormalization:
+    """
+    Small implementation of Batch Normalization.
+    Mean and variance have to be updated manually.
+    """
+    def __init__(self):
+        self.beta = None
+        self.loggamma = None
+        self.mean = None
+        self.variance = None
+        
+    def __call__(self,input,training=False):
+        if self.loggamma == None:
+            self.initialize(input)
+        return self.apply(input,training=training)
+    
+    def initialize(self,input):
+        n = int(input.shape[-1])
+        self.loggamma = tf.Variable(np.zeros(n),dtype=input.dtype,name='bn_loggamma')
+        self.beta = tf.Variable(np.zeros(n),dtype=input.dtype,name='bn_beta')
+        self.mean = tf.Variable(np.zeros(n),trainable=False,dtype=input.dtype,name='bn_mean')
+        self.variance = tf.Variable(np.ones(n),trainable=False,dtype=input.dtype,name='bn_variance')
+        self.variables = [self.loggamma,self.beta,self.mean,self.variance]
+    
+    def apply(self,input,training=False):
+        momenta = tf.nn.moments(input,[0])
+        x_hat = tf.cond(training, 
+                        lambda: (input-momenta[0])/tf.sqrt(momenta[1]+1e-7),
+                        lambda: (input-self.mean)/tf.sqrt(self.variance+1e-7))
+        output = tf.exp(self.loggamma)*x_hat+self.beta
+        return output
+    
     def eval_inv(self, sess, y):
         """
         Evaluates the inverse batch norm transformation for output y.
         :param y: output as numpy array
         :return: input as numpy array
         """
-        gamma,beta,moving_mean,moving_variance = sess.run(self.variables)
-        x_hat = (y - beta) / gamma
-        x = np.sqrt(moving_variance) * x_hat + moving_mean
+        loggamma,beta,mean,variance = sess.run(self.variables)
+        x_hat = (y - beta) / np.exp(loggamma)
+        x = np.sqrt(variance) * x_hat + mean
 
         return x
     
@@ -26,7 +57,7 @@ class MaskedAutoregressiveFlow:
     mades are of the same type. If there is only one made in the stack, then it's equivalent to a single made.
     """
 
-    def __init__(self, n_inputs, n_hiddens, act_fun, n_mades, batch_norm=False, momentum=0.2, 
+    def __init__(self, n_inputs, n_hiddens, act_fun, n_mades, batch_norm=False,
                  input_order='sequential', mode='sequential', input=None):
         """
         Constructor.
@@ -35,7 +66,6 @@ class MaskedAutoregressiveFlow:
         :param act_fun: tensorflow activation function
         :param n_mades: number of mades
         :param batch_norm: whether to use batch normalization between mades
-        :param momentum: momentum for moving mean and variance of the batch normalization layers
         :param input_order: order of inputs of last made
         :param mode: strategy for assigning degrees to hidden nodes: can be 'random' or 'sequential'
         :param input: tensorflow placeholder to serve as input; if None, a new placeholder is created
@@ -56,6 +86,8 @@ class MaskedAutoregressiveFlow:
 
         self.mades = []
         self.bns = []
+        self.moments = []
+        self.assign_bns = []
         self.u = self.input
         self.logdet_dudx = 0.0
 
@@ -65,6 +97,7 @@ class MaskedAutoregressiveFlow:
             made = mades.GaussianMade(n_inputs, n_hiddens, act_fun, input_order, mode, self.u)
             self.mades.append(made)
             self.parms += made.parms
+            # invert input order
             input_order = input_order if input_order == 'random' else made.input_order[::-1]
 
             # inverse autoregressive transform
@@ -73,13 +106,17 @@ class MaskedAutoregressiveFlow:
 
             # batch normalization
             if batch_norm:
-                bn = BatchNormalizationExt(momentum=self.momentum)
-                v_tmp = tf.nn.moments(self.u,[0])[1]
-                self.u = bn.apply(self.u,training=self.training)
-                self.parms += [bn.gamma,bn.beta]
-                v_tmp = tf.cond(self.training,lambda:v_tmp,lambda:bn.moving_variance)
-                self.logdet_dudx += tf.reduce_sum(tf.log(bn.gamma)) - 0.5 * tf.reduce_sum(tf.log(v_tmp+1e-5))
+                bn = BatchNormalization()
+                moments = tf.nn.moments(self.u,[0])
+                v_tmp = moments[1]
+                self.u = bn(self.u,training=self.training)
+                self.parms += [bn.loggamma,bn.beta]
+                v_tmp = tf.cond(self.training,lambda:v_tmp,lambda:bn.variance)
+                self.logdet_dudx += tf.reduce_sum(bn.loggamma) - 0.5 * tf.reduce_sum(tf.log(v_tmp+1e-5))
                 self.bns.append(bn)
+                self.moments.append(moments)
+                self.assign_bns.append(tf.assign(bn.mean,moments[0]))
+                self.assign_bns.append(tf.assign(bn.variance,moments[1]))
 
         self.input_order = self.mades[0].input_order
 
@@ -90,18 +127,166 @@ class MaskedAutoregressiveFlow:
         # train objective
         self.trn_loss = -tf.reduce_mean(self.L,name='trn_loss')
 
-    def eval(self, x, sess, log=True):
+    def eval(self, x, sess, log=True, training=False):
         """
         Evaluate log probabilities for given inputs.
         :param x: data matrix where rows are inputs
         :param sess: tensorflow session where the graph is run
         :param log: whether to return probabilities in the log domain
+        :param training: in training, data mean and variance is used for batchnorm
+                         while outside training the saved mean and variance is used
         :return: list of log probabilities log p(x)
         """        
 
-        lprob = sess.run(self.L,feed_dict={self.input:x})
+        lprob = sess.run(self.L,feed_dict={self.input:x,self.training:training})
 
         return lprob if log else np.exp(lprob)
+    
+    def update_batch_norm(self,x,sess):
+        """
+        Updates batch normalization moments with the values obtained in data set x.
+        :param x: data matrix whose moments will be used for the update
+        :param sess: tensorflow session where the graph is run
+        :return: None
+        """
+        sess.run(self.assign_bns,feed_dict={self.input:x,self.training:True})
+        
+
+    def gen(self, sess, n_samples=1, u=None):
+        """
+        Generate samples, by propagating random numbers through each made.
+        :param sess: tensorflow session where the graph is run
+        :param n_samples: number of samples
+        :param u: random numbers to use in generating samples; if None, new random numbers are drawn
+        :return: samples
+        """
+
+        x = rng.randn(n_samples, self.n_inputs) if u is None else u
+
+        if getattr(self, 'batch_norm', False):
+
+            for made, bn in zip(self.mades[::-1], self.bns[::-1]):
+                x = bn.eval_inv(sess,x)
+                x = made.gen(sess,n_samples, x)
+
+        else:
+
+            for made in self.mades[::-1]:
+                x = made.gen(sess,n_samples, x)
+
+        return x
+
+    def calc_random_numbers(self, x, sess):
+        """
+        Givan a dataset, calculate the random numbers used internally to generate the dataset.
+        :param x: numpy array, rows are datapoints
+        :param sess: tensorflow session where the graph is run
+        :return: numpy array, rows are corresponding random numbers
+        """
+
+        return sess.run(self.u,feed_dict={self.input:x})
+    
+class WeightedMaskedAutoregressiveFlow:
+    """
+    Implements a Masked Autoregressive Flow, which is a stack of mades such that the random numbers which drive made i
+    are generated by made i-1. The first made is driven by standard gaussian noise. In the current implementation, all
+    mades are of the same type. If there is only one made in the stack, then it's equivalent to a single made.
+    """
+
+    def __init__(self, n_inputs, n_hiddens, act_fun, n_mades, batch_norm=False,
+                 input_order='sequential', mode='sequential', input=None):
+        """
+        Constructor.
+        :param n_inputs: number of inputs
+        :param n_hiddens: list with number of hidden units for each hidden layer
+        :param act_fun: tensorflow activation function
+        :param n_mades: number of mades
+        :param batch_norm: whether to use batch normalization between mades
+        :param input_order: order of inputs of last made
+        :param mode: strategy for assigning degrees to hidden nodes: can be 'random' or 'sequential'
+        :param input: tensorflow placeholder to serve as input; if None, a new placeholder is created
+        """
+
+        # save input arguments
+        self.n_inputs = n_inputs
+        self.n_hiddens = n_hiddens
+        self.act_fun = act_fun
+        self.n_mades = n_mades
+        self.batch_norm = batch_norm
+        self.mode = mode
+
+        self.input = tf.placeholder(dtype=dtype,shape=[None,n_inputs],name='x') if input is None else input
+        self.weights = tf.placeholder(dtype=dtype,shape=[None,1],name='weights') 
+        self.training = tf.placeholder_with_default(False,shape=(),name="training")
+        self.parms = []
+
+        self.mades = []
+        self.bns = []
+        self.moments = []
+        self.assign_bns = []
+        self.u = self.input
+        self.logdet_dudx = 0.0
+
+        for i in range(n_mades):
+
+            # create a new made
+            made = mades.GaussianMade(n_inputs, n_hiddens, act_fun, input_order, mode, self.u)
+            self.mades.append(made)
+            self.parms += made.parms
+            # invert input order
+            input_order = input_order if input_order == 'random' else made.input_order[::-1]
+
+            # inverse autoregressive transform
+            self.u = made.u
+            self.logdet_dudx += 0.5 * tf.reduce_sum(made.logp, axis=1,keepdims=True)
+
+            # batch normalization
+            if batch_norm:
+                bn = BatchNormalization()
+                moments = tf.nn.moments(self.u,[0])
+                v_tmp = moments[1]
+                self.u = bn(self.u,training=self.training)
+                self.parms += [bn.loggamma,bn.beta]
+                v_tmp = tf.cond(self.training,lambda:v_tmp,lambda:bn.variance)
+                self.logdet_dudx += tf.reduce_sum(bn.loggamma) - 0.5 * tf.reduce_sum(tf.log(v_tmp+1e-5))
+                self.bns.append(bn)
+                self.moments.append(moments)
+                self.assign_bns.append(tf.assign(bn.mean,moments[0]))
+                self.assign_bns.append(tf.assign(bn.variance,moments[1]))
+
+        self.input_order = self.mades[0].input_order
+
+        # log likelihoods
+        self.L = tf.add(-0.5 * n_inputs * np.log(2 * np.pi) - 0.5 * tf.reduce_sum(self.u ** 2, axis=1,keepdims=True),
+                        self.logdet_dudx,name='L')
+
+        # train objective
+        self.trn_loss = -tf.divide(tf.reduce_sum(self.weights*self.L),tf.reduce_sum(self.weights),name='trn_loss')
+
+    def eval(self, x, sess, log=True, training=False):
+        """
+        Evaluate log probabilities for given inputs.
+        :param x: data matrix where rows are inputs
+        :param sess: tensorflow session where the graph is run
+        :param log: whether to return probabilities in the log domain
+        :param training: in training, data mean and variance is used for batchnorm
+                         while outside training the saved mean and variance is used
+        :return: list of log probabilities log p(x)
+        """        
+
+        lprob = sess.run(self.L,feed_dict={self.input:x,self.training:training})
+
+        return lprob if log else np.exp(lprob)
+    
+    def update_batch_norm(self,x,sess):
+        """
+        Updates batch normalization moments with the values obtained in data set x.
+        :param x: data matrix whose moments will be used for the update
+        :param sess: tensorflow session where the graph is run
+        :return: None
+        """
+        sess.run(self.assign_bns,feed_dict={self.input:x,self.training:True})
+        
 
     def gen(self, sess, n_samples=1, u=None):
         """
@@ -142,7 +327,7 @@ class ConditionalMaskedAutoregressiveFlow:
     Implements a Conditional Masked Autoregressive Flow.
     """
 
-    def __init__(self, n_inputs, n_outputs, n_hiddens, act_fun, n_mades, batch_norm=False, momentum=0.2,
+    def __init__(self, n_inputs, n_outputs, n_hiddens, act_fun, n_mades, batch_norm=False,
                  output_order='sequential', mode='sequential', input=None, output=None):
         """
         Constructor.
@@ -152,7 +337,6 @@ class ConditionalMaskedAutoregressiveFlow:
         :param act_fun: tensorflow activation function
         :param n_mades: number of mades in the flow
         :param batch_norm: whether to use batch normalization between mades in the flow
-        :param momentum: momentum for moving mean and variance of the batch normalization layers
         :param output_order: order of outputs of last made
         :param mode: strategy for assigning degrees to hidden nodes: can be 'random' or 'sequential'
         :param input: tensorflow placeholder to serve as input; if None, a new placeholder is created
@@ -166,7 +350,6 @@ class ConditionalMaskedAutoregressiveFlow:
         self.act_fun = act_fun
         self.n_mades = n_mades
         self.batch_norm = batch_norm
-        self.momentum = momentum
         self.mode = mode
 
         self.input = tf.placeholder(dtype=dtype,shape=[None,n_inputs],name='x') if input is None else input
@@ -176,6 +359,8 @@ class ConditionalMaskedAutoregressiveFlow:
 
         self.mades = []
         self.bns = []
+        self.moments = []
+        self.assign_bns = []
         self.u = self.y
         self.logdet_dudy = 0.0
 
@@ -194,13 +379,17 @@ class ConditionalMaskedAutoregressiveFlow:
 
             # batch normalization
             if batch_norm:
-                bn = BatchNormalizationExt(momentum=self.momentum)
-                v_tmp = tf.nn.moments(self.u,[0])[1]
-                self.u = bn.apply(self.u,training=self.training)
-                self.parms += [bn.gamma,bn.beta]
-                v_tmp = tf.cond(self.training,lambda:v_tmp,lambda:bn.moving_variance)
-                self.logdet_dudy += tf.reduce_sum(tf.log(bn.gamma)) - 0.5 * tf.reduce_sum(tf.log(v_tmp+1e-5))
+                bn = BatchNormalization()
+                moments = tf.nn.moments(self.u,[0])
+                v_tmp = moments[1]
+                self.u = bn(self.u,training=self.training)
+                self.parms += [bn.loggamma,bn.beta]
+                v_tmp = tf.cond(self.training,lambda:v_tmp,lambda:bn.variance)
+                self.logdet_dudy += tf.reduce_sum(bn.loggamma) - 0.5 * tf.reduce_sum(tf.log(v_tmp+1e-5))
                 self.bns.append(bn)
+                self.moments.append(moments)
+                self.assign_bns.append(tf.assign(bn.mean,moments[0]))
+                self.assign_bns.append(tf.assign(bn.variance,moments[1]))
 
         self.output_order = self.mades[0].output_order
 
@@ -211,19 +400,31 @@ class ConditionalMaskedAutoregressiveFlow:
         # train objective
         self.trn_loss = -tf.reduce_mean(self.L,name='trn_loss')
 
-    def eval(self, xy, sess, log=True):
+    def eval(self, xy, sess, log=True, training=False):
         """
         Evaluate log probabilities for given input-output pairs.
         :param xy: a pair (x, y) where x rows are inputs and y rows are outputs
         :param sess: tensorflow session where the graph is run
         :param log: whether to return probabilities in the log domain
+        :param training: in training, data mean and variance is used for batchnorm
+                         while outside training the saved mean and variance is used
         :return: log probabilities: log p(y|x)
         """
         
         x, y = xy
-        lprob = sess.run(self.L,feed_dict={self.input:x,self.y:y})
+        lprob = sess.run(self.L,feed_dict={self.input:x,self.y:y,self.training:training})
 
         return lprob if log else np.exp(lprob)
+    
+    def update_batch_norm(self,xy,sess):
+        """
+        Updates batch normalization moments with the values obtained in data set x.
+        :param x: data matrix whose moments will be used for the update
+        :param sess: tensorflow session where the graph is run
+        :return: None
+        """
+        x, y = xy
+        sess.run(self.assign_bns,feed_dict={self.input:x,self.y:y,self.training:True})
 
     def gen(self, x, sess, n_samples=1, u=None):
         """
@@ -235,7 +436,147 @@ class ConditionalMaskedAutoregressiveFlow:
         :return: samples
         """
 
-        y = rng.randn(n_samples, self.n_outputs).astype(dtype) if u is None else u
+        y = rng.randn(n_samples, self.n_outputs) if u is None else u
+
+        if getattr(self, 'batch_norm', False):
+
+            for made, bn in zip(self.mades[::-1], self.bns[::-1]):
+                y = bn.eval_inv(sess,y)
+                y = made.gen(x, sess, n_samples, y)
+
+        else:
+
+            for made in self.mades[::-1]:
+                y = made.gen(x, sess, n_samples, y)
+
+        return y
+
+    def calc_random_numbers(self, xy):
+        """
+        Givan a dataset, calculate the random numbers used internally to generate the dataset.
+        :param xy: a pair (x, y) of numpy arrays, where x rows are inputs and y rows are outputs
+        :return: numpy array, rows are corresponding random numbers
+        """
+
+        x, y = xy
+        return sess.run(self.u,feed_dict={self.input:x,self.y:y})
+
+class WeightedConditionalMaskedAutoregressiveFlow:
+    """
+    Implements a Conditional Masked Autoregressive Flow.
+    """
+
+    def __init__(self, n_inputs, n_outputs, n_hiddens, act_fun, n_mades, batch_norm=False,
+                 output_order='sequential', mode='sequential', input=None, output=None):
+        """
+        Constructor.
+        :param n_inputs: number of (conditional) inputs
+        :param n_outputs: number of outputs
+        :param n_hiddens: list with number of hidden units for each hidden layer
+        :param act_fun: tensorflow activation function
+        :param n_mades: number of mades in the flow
+        :param batch_norm: whether to use batch normalization between mades in the flow
+        :param output_order: order of outputs of last made
+        :param mode: strategy for assigning degrees to hidden nodes: can be 'random' or 'sequential'
+        :param input: tensorflow placeholder to serve as input; if None, a new placeholder is created
+        :param output: tensorflow placeholder to serve as output; if None, a new placeholder is created
+        """
+
+        # save input arguments
+        self.n_inputs = n_inputs
+        self.n_outputs = n_outputs
+        self.n_hiddens = n_hiddens
+        self.act_fun = act_fun
+        self.n_mades = n_mades
+        self.batch_norm = batch_norm
+        self.mode = mode
+
+        self.input = tf.placeholder(dtype=dtype,shape=[None,n_inputs],name='x') if input is None else input
+        self.weights = tf.placeholder(dtype=dtype,shape=[None,1],name='weights') 
+        self.y = tf.placeholder(dtype=dtype,shape=[None,n_outputs],name='y') if output is None else output
+        self.training = tf.placeholder_with_default(False,shape=(),name="training")
+        self.parms = []
+
+        self.mades = []
+        self.bns = []
+        self.moments = []
+        self.assign_bns = []
+        self.u = self.y
+        self.logdet_dudy = 0.0
+
+        for i in range(n_mades):
+
+            # create a new made
+            made = mades.ConditionalGaussianMade(n_inputs, n_outputs, n_hiddens, act_fun, 
+                                                 output_order, mode, self.input, self.u)
+            self.mades.append(made)
+            self.parms += made.parms
+            output_order = output_order if output_order == 'random' else made.output_order[::-1]
+
+            # inverse autoregressive transform
+            self.u = made.u
+            self.logdet_dudy += 0.5 * tf.reduce_sum(made.logp, axis=1,keepdims=True)
+
+            # batch normalization
+            if batch_norm:
+                bn = BatchNormalization()
+                moments = tf.nn.moments(self.u,[0])
+                v_tmp = moments[1]
+                self.u = bn(self.u,training=self.training)
+                self.parms += [bn.loggamma,bn.beta]
+                v_tmp = tf.cond(self.training,lambda:v_tmp,lambda:bn.variance)
+                self.logdet_dudy += tf.reduce_sum(bn.loggamma) - 0.5 * tf.reduce_sum(tf.log(v_tmp+1e-5))
+                self.bns.append(bn)
+                self.moments.append(moments)
+                self.assign_bns.append(tf.assign(bn.mean,moments[0]))
+                self.assign_bns.append(tf.assign(bn.variance,moments[1]))
+
+        self.output_order = self.mades[0].output_order
+
+        # log likelihoods
+        self.L = tf.add(-0.5 * n_outputs * np.log(2 * np.pi) - 0.5 * tf.reduce_sum(self.u ** 2, axis=1,keepdims=True),
+                        self.logdet_dudy,name='L')
+
+        # train objective
+        self.trn_loss = -tf.reduce_mean(self.weights*self.L,name='trn_loss')
+
+    def eval(self, xy, sess, log=True, training=False):
+        """
+        Evaluate log probabilities for given input-output pairs.
+        :param xy: a pair (x, y) where x rows are inputs and y rows are outputs
+        :param sess: tensorflow session where the graph is run
+        :param log: whether to return probabilities in the log domain
+        :param training: in training, data mean and variance is used for batchnorm
+                         while outside training the saved mean and variance is used
+        :return: log probabilities: log p(y|x)
+        """
+        
+        x, y = xy
+        lprob = sess.run(self.L,feed_dict={self.input:x,self.y:y,self.training:training})
+
+        return lprob if log else np.exp(lprob)
+    
+    def update_batch_norm(self,xy,sess):
+        """
+        Updates batch normalization moments with the values obtained in data set x.
+        :param x: data matrix whose moments will be used for the update
+        :param sess: tensorflow session where the graph is run
+        :return: None
+        """
+        x, y = xy
+        sess.run(self.assign_bns,feed_dict={self.input:x,self.y:y,self.training:True})
+
+    def gen(self, x, sess, n_samples=1, u=None):
+        """
+        Generate samples, by propagating random numbers through each made, after conditioning on input x.
+        :param x: input vector
+        :param sess: tensorflow session where the graph is run
+        :param n_samples: number of samples
+        :param u: random numbers to use in generating samples; if None, new random numbers are drawn
+        :return: samples
+        """
+
+        y = rng.randn(n_samples, self.n_outputs) if u is None else u
 
         if getattr(self, 'batch_norm', False):
 

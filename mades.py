@@ -332,8 +332,8 @@ class ConditionalGaussianMade:
         :return: samples
         """
 
-        y = np.zeros([n_samples, self.n_outputs], dtype=dtype)
-        u = rng.randn(n_samples, self.n_outputs).astype(dtype) if u is None else u
+        y = np.zeros([n_samples, self.n_outputs])
+        u = rng.randn(n_samples, self.n_outputs) if u is None else u
 
         xy = (np.tile(x, [n_samples, 1]), y)
 
